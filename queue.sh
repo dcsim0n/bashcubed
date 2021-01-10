@@ -3,12 +3,15 @@
 #create temp files and work queue
 #can you lock fifo queue?
 
+WORKERS=2
+
 WORKER_NUMS=$(mktemp /tmp/start-XXXX)
 QUEUE_FIFO=$(mktemp /tmp/workq-XXXX)
 EXIT_CODES=$(mktemp /tmp/exitq-XXXX)
 TOTAL_JOBS=0
 
-trap cleanup EXIT
+trap queue_cleanup EXIT
+
 #convert temp file to fifo
 rm $QUEUE_FIFO
 mkfifo $QUEUE_FIFO
@@ -26,7 +29,7 @@ somefailure(){
 }
 
 #define worker behavior
-worker(){
+queue_worker(){
   #sub shell, different file descriptors
   #-open fifo queue for reading to fd #3
   #-open exit queue for writing exit status, fd #4
@@ -50,7 +53,7 @@ worker(){
     flock -u 3
     if [[ $DID_READ_DATA -eq 0 ]]
     then
-      echo "Starting $job_id"
+      echo "Starting job: $job_id"
       ( "$job" )
 #-capture exit status from subshell
 #-write exit status to exit fifo
@@ -69,20 +72,20 @@ worker(){
   exec 5<&-
 }
 
-cleanup(){
+queue_cleanup(){
   rm $WORKER_NUMS
   rm $QUEUE_FIFO
   rm $EXIT_CODES
 }
 
-WORKERS=4
-start_queue()
+queue_start()
 {
+  echo "Queue start called. Starting $WORKERS worker threads"
   #initialize workers
   for(( i=1;i<=$WORKERS;i++ ))
   do
     echo "trying to start worker $i"
-    worker $i& #workers will wait for a job
+    queue_worker $i& #workers will wait for a job
   done
   #open fifo for writing to fd #3, will unblock workers
   exec 3>$QUEUE_FIFO
@@ -92,17 +95,20 @@ start_queue()
   while true #start all the works, wait for them all to be ready
   do
     WORKERS_ACTIVE=$(wc -l $WORKER_NUMS | cut -d \  -f1)
-    if [[ $WORKERS_ACTIVE -eq 4 ]]
+    if [[ $WORKERS_ACTIVE -le 4 ]]
     then
       break # all workers have started, get on with it
     else
       echo "Waiting for workers to start.."
     fi
   done
-  echo \0>$WORKER_NUMS #workers started, empty workers file for next use
+  flock 4
+  >$WORKER_NUMS #workers started, empty workers file for next use
+  flock -u 4
+  echo "All workers started. Queue is waiting for work."
 }
 
-queue_job()
+queue_enqueue()
 {
  job_id=$TOTAL_JOBS
  job_task="$1"
@@ -110,50 +116,47 @@ queue_job()
  echo "$job_id $job_task" >> $QUEUE_FIFO
 }
 
-close_queue(){
+queue_close(){
+  echo "Closing queue. Workers will finish current job and exit."
   exec 3>&-
-  
 }
 
-check_queue_success(){
+queue_check_success(){
   flock 4
   FAILS=$(grep -Ec '^[0-9]+ [^0]$' $EXIT_CODES)
   flock -u 4
   if [[ $FAILS -gt 0 ]]
   then
-    echo $FAILS workers failed
+    echo "$FAILS workers failed"
     exit 1 
   #handle statuses
   fi
 }
 
-start_queue
+queue_start
 
 #send jobs to the workers
-queue_job somework 
-queue_job somework
-queue_job somework
-queue_job somefailure
-queue_job somefailure
+queue_enqueue somework 
+queue_enqueue somework
+queue_enqueue somework
+queue_enqueue somefailure
+queue_enqueue somefailure
 
-close_queue
-echo "closing queue"
+queue_close
+
 wait
+
 echo "done waiting"
-# check exit status
-
-echo "main script won't continue"
-
-start_queue
-
+#
+queue_start
+#
 #send jobs to the workers
-queue_job somework 
-queue_job somework
-queue_job somework
-queue_job somefailure
-queue_job somefailure
-
-close_queue
-
+queue_enqueue somework 
+queue_enqueue somefailure
+queue_enqueue somefailure
+#
+queue_close
+#
 wait
-check_queue_success
+## check exit status
+queue_check_success
